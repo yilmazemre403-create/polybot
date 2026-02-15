@@ -416,13 +416,68 @@ def main():
             n_mom = mids.get(no_id).mom()
 
             pick = None
-if y_mom is not None and y_mom >= cfg.mom_threshold:
-    pick = ("YES", yes_id)
-elif n_mom is not None and n_mom >= cfg.mom_threshold:
-    pick = ("NO", no_id)
+            if y_mom is not None and y_mom >= cfg.mom_threshold:
+                pick = ("YES", yes_id)
+            elif n_mom is not None and n_mom >= cfg.mom_threshold:
+                pick = ("NO", no_id)
 
-if not pick:
-    time.sleep(cfg.scan_interval_sec)
-    continue
+            if not pick:
+                time.sleep(cfg.scan_interval_sec)
+                continue
 
+            outcome, token_id = pick
 
+            # Re-fetch book RIGHT BEFORE placing entry (safer)
+            bid, ask, bsz, asz = get_best_bid_ask_size(client, token_id)
+            if bid is None or ask is None or min(bsz, asz) < cfg.min_top_size:
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            sp = spread_ratio(bid, ask)
+            if sp is None or sp > cfg.max_spread:
+                log(f"Skip: entry spread changed {outcome} sp={sp}")
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            price = clamp_price(ask)  # buy at ask
+            qty = shares_for_usd(cfg.trade_usd, price)
+            if qty < 1:
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            log(f"ENTRY {outcome}: qty={qty} buy@{price:.3f} momYES={y_mom} momNO={n_mom} spread={sp:.3f} pnl=${realized_pnl_usd:.2f}")
+
+            if not cfg.dry_run:
+                args = OrderArgs(price=price, size=qty, side=BUY, token_id=token_id)
+                resp = post_gtc(client, args)
+                oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+                if oid:
+                    st = try_fill_or_cancel(client, oid, wait_sec=6)
+                    log(f"ENTRY order status: {st}")
+                    if st != "filled":
+                        time.sleep(cfg.scan_interval_sec)
+                        continue
+            else:
+                log("DRY_RUN: entry order skipped")
+
+            open_positions.append({
+                "side": BUY,
+                "outcome": outcome,
+                "token_id": token_id,
+                "qty": qty,
+                "entry_price": price,
+                "opened_at": time.time(),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "event_slug": ev.get("slug"),
+            })
+            trades_today += 1
+
+            time.sleep(cfg.scan_interval_sec)
+
+        except Exception as e:
+            log(f"ERROR: {type(e).__name__}: {e}")
+            time.sleep(max(3, cfg.scan_interval_sec))
+
+if __name__ == "__main__":
+    main()
