@@ -546,9 +546,19 @@ def main():
 
             now_ts = time.time()
             if (now_ts - last_market_refresh) > 5 or market is None:
-                market = gamma_find_market(cfg)
+                market = 
                 last_market_refresh = now_ts
-                if not market:
+                if not market = {
+    "slug": "btc-updown-5m-fixed",
+    "title": "BTC 5m",
+    "endDate": "",
+    "liquidity": 0,
+    "yes_token_id": "70944884642871352300383996018804119896964134070930584219733294320743873421145",
+    "no_token_id": "112390795941265302492523936944625982539170448003020213137524724408959211298208",
+}
+
+
+
                     log("No active series market found (gamma). retry...")
                     time.sleep(cfg.scan_interval_sec)
                     continue
