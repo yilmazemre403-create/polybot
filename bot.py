@@ -29,33 +29,33 @@ class Config:
     funder: Optional[str]
     signature_type: int
 
-    # fixed stake per trade (USD)
+    dry_run: bool
+
+    # money/rules
     trade_usd: float
-
-    # limits
-    max_trades_per_day: int
     max_open_positions: int
-
-    # TP/SL on token price
+    max_trades_per_day: int
     tp_pct: float
     sl_pct: float
-
-    # daily hard limits (USD)
     daily_loss_limit_usd: float
     daily_profit_target_usd: float
 
-    # execution filters
+    # filters
+    min_liquidity_usd: float
     max_spread: float
+    end_buffer_sec: int
+
+    # timing
     scan_interval_sec: int
     order_timeout_sec: int
     cooldown_after_trade_sec: int
-    end_buffer_sec: int
 
     # signal
     mom_window_sec: int
     mom_threshold: float
 
-    dry_run: bool
+    # order min size
+    order_min_size: float
 
     @staticmethod
     def from_env() -> "Config":
@@ -74,27 +74,28 @@ class Config:
             funder=os.getenv("POLYMARKET_FUNDER", "").strip() or None,
             signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "0")),
 
+            dry_run=os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y"),
+
             trade_usd=float(os.getenv("TRADE_USD", "6")),
-
-            max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-
+            max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
             tp_pct=float(os.getenv("TP_PCT", "0.06")),
             sl_pct=float(os.getenv("SL_PCT", "0.04")),
-
             daily_loss_limit_usd=float(os.getenv("DAILY_LOSS_LIMIT_USD", "15")),
             daily_profit_target_usd=float(os.getenv("DAILY_PROFIT_TARGET_USD", "20")),
 
+            min_liquidity_usd=float(os.getenv("MIN_LIQUIDITY_USD", "1000")),
             max_spread=float(os.getenv("MAX_SPREAD", "0.05")),
+            end_buffer_sec=int(os.getenv("END_BUFFER_SEC", "45")),
+
             scan_interval_sec=int(os.getenv("SCAN_INTERVAL_SEC", "10")),
             order_timeout_sec=int(os.getenv("ORDER_TIMEOUT_SEC", "45")),
             cooldown_after_trade_sec=int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "20")),
-            end_buffer_sec=int(os.getenv("END_BUFFER_SEC", "45")),
 
             mom_window_sec=int(os.getenv("MOM_WINDOW_SEC", "60")),
             mom_threshold=float(os.getenv("MOM_THRESHOLD", "0.008")),
 
-            dry_run=os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y"),
+            order_min_size=float(os.getenv("ORDER_MIN_SIZE", "5")),
         )
 
 
@@ -104,18 +105,22 @@ class Config:
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
-def round_down(x: float, decimals: int) -> float:
-    p = 10 ** decimals
-    return math.floor(x * p) / p
-
-def safe_price(p: float) -> float:
-    return max(0.01, min(0.99, p))
-
 def _parse_iso_z(s: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
+def safe_price(p: float) -> float:
+    return max(0.01, min(0.99, p))
+
+def round_price_tick(p: float, tick: float = 0.01) -> float:
+    p = safe_price(p)
+    return round(math.floor(p / tick) * tick, 2)
+
+def round_down(x: float, decimals: int) -> float:
+    p = 10 ** decimals
+    return math.floor(x * p) / p
 
 def reset_day_if_needed(state: Dict[str, Any]) -> None:
     today = str(date.today())
@@ -138,7 +143,6 @@ def load_state() -> Dict[str, Any]:
                 return s
         except Exception:
             pass
-
     return {
         "day": str(date.today()),
         "daily_pnl_usd": 0.0,
@@ -149,15 +153,12 @@ def load_state() -> Dict[str, Any]:
     }
 
 def save_state(state: Dict[str, Any]) -> None:
-    # shrink hist
-    try:
-        hist = state.get("hist") or {}
-        for k in ("YES", "NO"):
-            if k in hist and isinstance(hist[k], list) and len(hist[k]) > 300:
-                hist[k] = hist[k][-300:]
-        state["hist"] = hist
-    except Exception:
-        pass
+    # shrink hist to avoid huge file
+    hist = state.get("hist") or {}
+    for k in ("YES", "NO"):
+        if isinstance(hist.get(k), list) and len(hist[k]) > 400:
+            hist[k] = hist[k][-400:]
+    state["hist"] = hist
 
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -217,12 +218,11 @@ def cancel_order_safe(client: ClobClient, order_id: str) -> None:
 
 
 # =========================
-# GAMMA MARKET PICK (FIXED)
+# GAMMA: robust dynamic market pick
 # =========================
 def pick_series_slug(m: Dict[str, Any]) -> Optional[str]:
-    # sometimes seriesSlug is not on root
     if m.get("seriesSlug"):
-        return str(m.get("seriesSlug"))
+        return str(m["seriesSlug"])
     ev = m.get("events")
     if isinstance(ev, list) and ev:
         s = ev[0].get("seriesSlug")
@@ -256,10 +256,13 @@ def parse_token_ids(m: Dict[str, Any]) -> Optional[Tuple[str, str]]:
 
     return None
 
-def gamma_find_best_market(cfg: Config, series_slug: str, end_buffer_sec: int) -> Optional[Dict[str, Any]]:
+def gamma_find_market(cfg: Config) -> Optional[Dict[str, Any]]:
+    """
+    Find latest tradable market for SERIES_SLUG.
+    We don't trust 'acceptingOrders' fully; we validate by orderbook + spread.
+    """
     url = f"{cfg.gamma_host}/markets"
-    params = {"limit": "200", "offset": "0", "order": "updatedAt", "ascending": "false"}
-
+    params = {"limit": "250", "offset": "0", "order": "updatedAt", "ascending": "false"}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     markets = r.json() or []
@@ -267,13 +270,15 @@ def gamma_find_best_market(cfg: Config, series_slug: str, end_buffer_sec: int) -
     now_utc = datetime.now(timezone.utc)
 
     for m in markets:
-        sslug = pick_series_slug(m)
-        if sslug != series_slug:
+        if pick_series_slug(m) != SERIES_SLUG:
             continue
-
         if not m.get("enableOrderBook", False):
             continue
         if m.get("closed", False) is True:
+            continue
+
+        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0.0)
+        if liq < cfg.min_liquidity_usd:
             continue
 
         end_str = m.get("endDate")
@@ -287,8 +292,7 @@ def gamma_find_best_market(cfg: Config, series_slug: str, end_buffer_sec: int) -
         end_dt = _parse_iso_z(end_str)
         if not end_dt:
             continue
-
-        if (end_dt - now_utc).total_seconds() <= end_buffer_sec:
+        if (end_dt - now_utc).total_seconds() <= cfg.end_buffer_sec:
             continue
 
         toks = parse_token_ids(m)
@@ -297,16 +301,13 @@ def gamma_find_best_market(cfg: Config, series_slug: str, end_buffer_sec: int) -
         yes_id, no_id = toks
 
         slug = m.get("slug") or ""
-        if not slug:
-            ev = m.get("events")
-            if isinstance(ev, list) and ev and ev[0].get("slug"):
-                slug = ev[0].get("slug")
-
         title = m.get("question") or m.get("title") or ""
+
         return {
             "slug": slug,
             "title": title,
             "endDate": end_str,
+            "liquidity": liq,
             "yes_token_id": yes_id,
             "no_token_id": no_id,
         }
@@ -315,7 +316,7 @@ def gamma_find_best_market(cfg: Config, series_slug: str, end_buffer_sec: int) -
 
 
 # =========================
-# SIGNAL: Polymarket mid-price momentum
+# SIGNAL: Polymarket YES mid-price momentum (no Binance)
 # =========================
 def get_mid(client: ClobClient, token_id: str) -> Optional[float]:
     bid, ask = get_order_book_top(client, token_id)
@@ -329,11 +330,11 @@ def update_hist_and_signal(
     no_id: str,
     hist: Dict[str, List[Tuple[float, float]]],
     window_sec: int,
-    threshold: float,
+    threshold: float
 ) -> Optional[str]:
     ts = time.time()
     yes_mid = get_mid(client, yes_id)
-    no_mid  = get_mid(client, no_id)
+    no_mid = get_mid(client, no_id)
     if yes_mid is None or no_mid is None:
         return None
 
@@ -359,10 +360,11 @@ def update_hist_and_signal(
 
 
 # =========================
-# LIMITS / TRADING
+# RULES / TRADING
 # =========================
 def can_trade(cfg: Config, state: Dict[str, Any]) -> Tuple[bool, str]:
     reset_day_if_needed(state)
+
     if int(state.get("trades_today", 0)) >= cfg.max_trades_per_day:
         return False, "max_trades_per_day"
     if len(state.get("open_positions", [])) >= cfg.max_open_positions:
@@ -376,12 +378,12 @@ def can_trade(cfg: Config, state: Dict[str, Any]) -> Tuple[bool, str]:
 
     return True, "ok"
 
-def orderbook_ok(client: ClobClient, cfg: Config, token_id: str) -> bool:
+def orderbook_ok(client: ClobClient, cfg: Config, token_id: str) -> Tuple[bool, Optional[float], Optional[float]]:
     bid, ask = get_order_book_top(client, token_id)
     if bid is None or ask is None:
-        return False
+        return False, None, None
     sp = spread_pct(bid, ask)
-    return sp <= cfg.max_spread
+    return sp <= cfg.max_spread, bid, ask
 
 def open_position(client: ClobClient, cfg: Config, state: Dict[str, Any], token_id: str, label: str) -> bool:
     ok, reason = can_trade(cfg, state)
@@ -389,22 +391,20 @@ def open_position(client: ClobClient, cfg: Config, state: Dict[str, Any], token_
         log(f"BLOCK OPEN: {reason}")
         return False
 
-    bid, ask = get_order_book_top(client, token_id)
-    if bid is None or ask is None:
+    ok_ob, bid, ask = orderbook_ok(client, cfg, token_id)
+    if not ok_ob or ask is None:
+        log("Orderbook not OK for entry.")
         return False
 
-    sp = spread_pct(bid, ask)
-    if sp > cfg.max_spread:
-        log(f"Spread too high: {sp*100:.2f}%")
-        return False
-
-    price = safe_price(float(ask))  # marketable buy
-    stake = round_down(cfg.trade_usd, 2)  # <-- FIXED $6
+    price = round_price_tick(float(ask), 0.01)
+    stake = float(cfg.trade_usd)
     size = round_down(stake / price, 2)
-    if size <= 0:
+
+    if size < cfg.order_min_size:
+        log(f"Size too small ({size}) < ORDER_MIN_SIZE ({cfg.order_min_size}).")
         return False
 
-    log(f"OPEN {label} price={price:.4f} size={size:.2f} stake={stake:.2f} DRY_RUN={cfg.dry_run}")
+    log(f"OPEN {label} price={price:.2f} size={size:.2f} stake=${stake:.2f} DRY_RUN={cfg.dry_run}")
 
     if cfg.dry_run:
         state["open_positions"].append({
@@ -457,14 +457,14 @@ def close_position(client: ClobClient, cfg: Config, state: Dict[str, Any], idx: 
     entry = float(pos["entry_price"])
     size = float(pos["size"])
 
-    bid, ask = get_order_book_top(client, token_id)
-    if bid is None or ask is None:
+    ok_ob, bid, ask = orderbook_ok(client, cfg, token_id)
+    if not ok_ob or bid is None:
         return
 
-    sell_price = round_down(safe_price(float(bid)), 4)
-    log(f"CLOSE {reason} {pos['label']} entry={entry:.4f} sell={sell_price:.4f} size={size:.2f} DRY_RUN={cfg.dry_run}")
-
+    sell_price = round_price_tick(float(bid), 0.01)
     pnl = (sell_price - entry) * size
+
+    log(f"CLOSE {reason} {pos['label']} entry={entry:.2f} sell={sell_price:.2f} size={size:.2f} pnl≈{pnl:.2f} DRY_RUN={cfg.dry_run}")
 
     if cfg.dry_run:
         state["daily_pnl_usd"] = float(state.get("daily_pnl_usd", 0.0)) + pnl
@@ -502,8 +502,8 @@ def manage_tp_sl(client: ClobClient, cfg: Config, state: Dict[str, Any]) -> None
         bid, ask = get_order_book_top(client, token_id)
         if bid is None or ask is None:
             continue
-
         mid = (bid + ask) / 2.0
+
         tp = entry * (1.0 + cfg.tp_pct)
         sl = entry * (1.0 - cfg.sl_pct)
 
@@ -521,11 +521,11 @@ def manage_tp_sl(client: ClobClient, cfg: Config, state: Dict[str, Any]) -> None
 def main():
     cfg = Config.from_env()
     state = load_state()
-
     client = make_client(cfg)
 
-    log(f"ONLINE DRY_RUN={cfg.dry_run} tradeUSD={cfg.trade_usd:.2f} maxOpen={cfg.max_open_positions} maxTrades={cfg.max_trades_per_day}")
-    log(f"Signal: window={cfg.mom_window_sec}s threshold={cfg.mom_threshold:.4f} endBuffer={cfg.end_buffer_sec}s maxSpread={cfg.max_spread:.2f}")
+    log(f"ONLINE DRY_RUN={cfg.dry_run} trade=${cfg.trade_usd:.2f} maxOpen={cfg.max_open_positions} maxTrades={cfg.max_trades_per_day}")
+    log(f"Filters: minLiq={cfg.min_liquidity_usd} maxSpread={cfg.max_spread} endBuffer={cfg.end_buffer_sec}s")
+    log(f"Signal: window={cfg.mom_window_sec}s threshold={cfg.mom_threshold}")
 
     last_market_refresh = 0.0
     market = None
@@ -540,33 +540,34 @@ def main():
 
             ok, reason = can_trade(cfg, state)
             if not ok:
-                log(f"PAUSED: {reason} pnl={state.get('daily_pnl_usd', 0.0):.2f} trades={state.get('trades_today', 0)} open={len(state.get('open_positions', []))}")
+                log(f"PAUSED: {reason} pnl≈{state.get('daily_pnl_usd', 0.0):.2f} trades={state.get('trades_today', 0)} open={len(state.get('open_positions', []))}")
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
-            # refresh market (these rotate fast)
             now_ts = time.time()
             if (now_ts - last_market_refresh) > 5 or market is None:
-                market = gamma_find_best_market(cfg, SERIES_SLUG, cfg.end_buffer_sec)
+                market = gamma_find_market(cfg)
                 last_market_refresh = now_ts
-
                 if not market:
                     log("No active series market found (gamma). retry...")
                     time.sleep(cfg.scan_interval_sec)
                     continue
 
+                # validate orderbooks
                 yes_id = market["yes_token_id"]
                 no_id = market["no_token_id"]
 
-                # ensure orderbook is tradable
-                if not orderbook_ok(client, cfg, yes_id) or not orderbook_ok(client, cfg, no_id):
-                    log("Market found but orderbook/spread not OK. retry...")
+                ok_yes, _, _ = orderbook_ok(client, cfg, yes_id)
+                ok_no,  _, _ = orderbook_ok(client, cfg, no_id)
+                if not ok_yes or not ok_no:
+                    log("Market found but spread/orderbook not OK. retry...")
                     time.sleep(cfg.scan_interval_sec)
                     continue
 
                 state["current_market"] = market
                 save_state(state)
-                log(f"Market: {market['slug']} | ends {market['endDate']}")
+
+                log(f"Market: {market['slug']} liq={market['liquidity']:.0f} ends={market['endDate']}")
 
             cm = state.get("current_market") or market
             if not cm:
@@ -590,16 +591,12 @@ def main():
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
-            # execute
             if sig == "LONG":
                 opened = open_position(client, cfg, state, yes_id, "YES(UP)")
             else:
                 opened = open_position(client, cfg, state, no_id, "NO(DOWN)")
 
-            if opened:
-                time.sleep(cfg.cooldown_after_trade_sec)
-            else:
-                time.sleep(cfg.scan_interval_sec)
+            time.sleep(cfg.cooldown_after_trade_sec if opened else cfg.scan_interval_sec)
 
         except Exception as e:
             log(f"ERROR: {e}")
