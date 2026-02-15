@@ -1,14 +1,14 @@
 import os
 import time
 import json
-import math
 import requests
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
 
 load_dotenv()
 
@@ -18,156 +18,206 @@ load_dotenv()
 class Config:
     private_key: str
     series_slug: str
-    trade_amount: float
-    max_open_positions: int
+    trade_usd: float
     scan_interval_sec: int
     dry_run: bool
+    chain_id: int
 
     @staticmethod
     def from_env():
+        pk = os.getenv("POLYMARKET_PK", "").strip()
+        if not pk:
+            raise RuntimeError("Missing env var: POLYMARKET_PK")
+        # allow 0x, strip if present
+        if pk.startswith("0x"):
+            pk = pk[2:]
         return Config(
-            private_key=os.environ["POLYMARKET_PK"],
-            series_slug=os.getenv("SERIES_SLUG", "btc-up-or-down-5m"),
-            trade_amount=float(os.getenv("TRADE_AMOUNT", "6")),
-            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-            scan_interval_sec=int(os.getenv("SCAN_INTERVAL_SEC", "15")),
-            dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
+            private_key=pk,
+            series_slug=os.getenv("SERIES_SLUG", "btc-up-or-down-5m").strip(),
+            trade_usd=float(os.getenv("TRADE_USD", "6")),
+            scan_interval_sec=int(os.getenv("SCAN_INTERVAL_SEC", "10")),
+            dry_run=os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y"),
+            chain_id=int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
         )
 
-# ================= LOG =================
-
-def log(msg):
+def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
-# ================= GAMMA TOKEN FETCH =================
+# ================= GAMMA: LIVE TOKENS =================
 
 def get_live_tokens(series_slug: str) -> Optional[Tuple[str, str]]:
     url = "https://gamma-api.polymarket.com/events"
     r = requests.get(url, params={"slug": series_slug}, timeout=20)
     r.raise_for_status()
-    events = r.json()
-
+    events = r.json() or []
     if not events:
         return None
 
-    event = events[0]
-    markets = event.get("markets", [])
+    ev = events[0]
+    markets = ev.get("markets") or []
+    if not markets:
+        return None
 
+    # pick first market with orderbook enabled & not closed
     for m in markets:
         if not m.get("enableOrderBook"):
             continue
         if m.get("closed"):
             continue
 
-        tokens = m.get("clobTokenIds")
-        if isinstance(tokens, str):
-            tokens = json.loads(tokens)
+        toks = m.get("clobTokenIds")
+        if isinstance(toks, str):
+            try:
+                toks = json.loads(toks)
+            except Exception:
+                toks = None
 
-        if isinstance(tokens, list) and len(tokens) >= 2:
-            return tokens[0], tokens[1]
+        if isinstance(toks, list) and len(toks) >= 2:
+            return str(toks[0]), str(toks[1])
 
     return None
 
-# ================= ORDERBOOK CHECK =================
+# ================= ORDERBOOK / MID =================
 
-def get_mid_price(client: ClobClient, token_id: str) -> Optional[float]:
+def get_best_bid_ask(client: ClobClient, token_id: str) -> Tuple[Optional[float], Optional[float]]:
     ob = client.get_order_book(token_id=token_id)
-    bids = ob.get("bids", [])
-    asks = ob.get("asks", [])
+    # py_clob_client bazen dict döner, bazen obj - ikisini de handle
+    bids = ob.get("bids", []) if isinstance(ob, dict) else (ob.bids or [])
+    asks = ob.get("asks", []) if isinstance(ob, dict) else (ob.asks or [])
+
     if not bids or not asks:
+        return None, None
+
+    # dict format
+    if isinstance(bids[0], dict):
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+    else:
+        best_bid = float(bids[0].price)
+        best_ask = float(asks[0].price)
+
+    return best_bid, best_ask
+
+def get_mid(client: ClobClient, token_id: str) -> Optional[float]:
+    bid, ask = get_best_bid_ask(client, token_id)
+    if bid is None or ask is None:
         return None
+    return (bid + ask) / 2.0
 
-    best_bid = float(bids[0]["price"])
-    best_ask = float(asks[0]["price"])
-    return (best_bid + best_ask) / 2
-
-# ================= SIMPLE MOMENTUM =================
+# ================= MOMENTUM SIGNAL =================
 
 class Momentum:
-    def __init__(self):
-        self.history = []
+    def __init__(self, window_sec: int = 60, threshold: float = 0.008):
+        self.window_sec = window_sec
+        self.threshold = threshold
+        self.hist: List[Tuple[float, float]] = []
 
-    def update(self, price):
+    def update(self, price: float):
         now = time.time()
-        self.history.append((now, price))
-        self.history = [(t, p) for t, p in self.history if now - t <= 60]
+        self.hist.append((now, price))
+        # keep ~3 windows
+        keep = self.window_sec * 3
+        self.hist = [(t, p) for (t, p) in self.hist if now - t <= keep]
 
-    def signal(self):
-        if len(self.history) < 2:
+    def signal(self) -> Optional[str]:
+        now = time.time()
+        past = [(t, p) for (t, p) in self.hist if now - t >= self.window_sec]
+        if not past:
             return None
-        first = self.history[0][1]
-        last = self.history[-1][1]
-        change = (last - first) / first
-        if change > 0.005:
+        p0 = past[0][1]
+        p1 = self.hist[-1][1]
+        mom = (p1 - p0) / p0
+        if mom > self.threshold:
             return "UP"
-        if change < -0.005:
+        if mom < -self.threshold:
             return "DOWN"
         return None
+
+# ================= ORDER =================
+
+def place_buy(client: ClobClient, token_id: str, usd: float, price: float, dry_run: bool) -> bool:
+    # shares = usd / price
+    size = usd / price
+    # min tick: round 2 decimals for size is safe
+    size = float(f"{size:.2f}")
+    price = float(f"{price:.2f}")  # price tick 0.01
+
+    log(f"BUY token={token_id[:10]}... price={price} size={size} usd={usd} DRY_RUN={dry_run}")
+
+    if dry_run:
+        return True
+
+    args = OrderArgs(
+        token_id=str(token_id),
+        side=BUY,
+        price=price,
+        size=size
+    )
+
+    signed = client.create_order(args)
+    resp = client.post_order(signed, OrderType.GTC)
+    oid = resp.get("orderID") or resp.get("id") or resp.get("order_id")
+    log(f"ORDER SENT id={oid} resp={resp}")
+    return True
 
 # ================= MAIN =================
 
 def main():
     cfg = Config.from_env()
 
+    # IMPORTANT: chain_id=137
     client = ClobClient(
         host="https://clob.polymarket.com",
-        key=cfg.private_key
+        key=cfg.private_key,
+        chain_id=cfg.chain_id,
     )
 
-    log(f"ONLINE DRY_RUN={cfg.dry_run} trade=${cfg.trade_amount}")
+    # API creds derive (needed)
+    client.set_api_creds(client.create_or_derive_api_creds())
 
-    mom_yes = Momentum()
-    mom_no = Momentum()
+    log(f"ONLINE DRY_RUN={cfg.dry_run} trade=${cfg.trade_usd} slug={cfg.series_slug} chain_id={cfg.chain_id}")
+
+    mom_yes = Momentum(window_sec=60, threshold=0.008)
+    mom_no = Momentum(window_sec=60, threshold=0.008)
+
+    last_tokens = (None, None)
 
     while True:
         try:
-            pair = get_live_tokens(cfg.series_slug)
-            if not pair:
-                log("No active market found, retry...")
+            tokens = get_live_tokens(cfg.series_slug)
+            if not tokens:
+                log("Gamma: no live tokens, retry...")
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
-            yes_id, no_id = pair
-            log(f"Live market YES={yes_id[:8]}... NO={no_id[:8]}...")
+            yes_id, no_id = tokens
 
-            price_yes = get_mid_price(client, yes_id)
-            price_no = get_mid_price(client, no_id)
+            if tokens != last_tokens:
+                log(f"NEW MARKET TOKENS YES={yes_id[:10]}... NO={no_id[:10]}...")
+                last_tokens = tokens
+                mom_yes = Momentum(window_sec=60, threshold=0.008)
+                mom_no = Momentum(window_sec=60, threshold=0.008)
 
-            if not price_yes or not price_no:
-                log("Orderbook not ready...")
+            yes_mid = get_mid(client, yes_id)
+            no_mid = get_mid(client, no_id)
+
+            if yes_mid is None or no_mid is None:
+                log("Orderbook not ready yet...")
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
-            mom_yes.update(price_yes)
-            mom_no.update(price_no)
+            mom_yes.update(yes_mid)
+            mom_no.update(no_mid)
 
-            sig_yes = mom_yes.signal()
-            sig_no = mom_no.signal()
-
-            if sig_yes == "UP":
-                log("Signal: BUY YES")
-                if not cfg.dry_run:
-                    client.create_order(
-                        token_id=yes_id,
-                        side=BUY,
-                        price=price_yes,
-                        size=cfg.trade_amount / price_yes,
-                        order_type="market"
-                    )
-
-            if sig_no == "UP":
-                log("Signal: BUY NO")
-                if not cfg.dry_run:
-                    client.create_order(
-                        token_id=no_id,
-                        side=BUY,
-                        price=price_no,
-                        size=cfg.trade_amount / price_no,
-                        order_type="market"
-                    )
+            # signal: if YES momentum up -> buy YES, if YES momentum down -> buy NO
+            sig = mom_yes.signal()
+            if sig == "UP":
+                place_buy(client, yes_id, cfg.trade_usd, yes_mid, cfg.dry_run)
+            elif sig == "DOWN":
+                place_buy(client, no_id, cfg.trade_usd, no_mid, cfg.dry_run)
 
         except Exception as e:
-            log(f"ERROR: {e}")
+            log("ERROR(FULL): " + repr(e))
 
         time.sleep(cfg.scan_interval_sec)
 
