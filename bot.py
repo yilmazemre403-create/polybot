@@ -257,62 +257,62 @@ def parse_token_ids(m: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     return None
 
 def gamma_find_market(cfg: Config) -> Optional[Dict[str, Any]]:
-    """
-    Find latest tradable market for SERIES_SLUG.
-    We don't trust 'acceptingOrders' fully; we validate by orderbook + spread.
-    """
-    url = f"{cfg.gamma_host}/markets"
-    params = {"limit": "250", "offset": "0", "order": "updatedAt", "ascending": "false"}
+    url = f"{cfg.gamma_host}/events"
+    params = {"slug": SERIES_SLUG}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    markets = r.json() or []
+    events = r.json() or []
+
+    if not events:
+        return None
+
+    event = events[0]
+    markets = event.get("markets", [])
+    if not markets:
+        return None
 
     now_utc = datetime.now(timezone.utc)
 
     for m in markets:
-        if pick_series_slug(m) != SERIES_SLUG:
-            continue
         if not m.get("enableOrderBook", False):
             continue
-        if m.get("closed", False) is True:
+        if m.get("closed", False):
             continue
 
-        liq = float(m.get("liquidityNum") or m.get("liquidity") or 0.0)
+        liq = float(m.get("liquidity") or 0.0)
         if liq < cfg.min_liquidity_usd:
             continue
 
         end_str = m.get("endDate")
-        if not end_str:
-            ev = m.get("events")
-            if isinstance(ev, list) and ev and ev[0].get("endDate"):
-                end_str = ev[0].get("endDate")
         if not end_str:
             continue
 
         end_dt = _parse_iso_z(end_str)
         if not end_dt:
             continue
+
         if (end_dt - now_utc).total_seconds() <= cfg.end_buffer_sec:
             continue
 
-        toks = parse_token_ids(m)
-        if not toks:
-            continue
-        yes_id, no_id = toks
+        tokens = m.get("clobTokenIds")
+        if isinstance(tokens, str):
+            tokens = json.loads(tokens)
 
-        slug = m.get("slug") or ""
-        title = m.get("question") or m.get("title") or ""
+        if not tokens or len(tokens) < 2:
+            continue
 
         return {
-            "slug": slug,
-            "title": title,
+            "slug": m.get("slug"),
+            "title": m.get("question"),
             "endDate": end_str,
             "liquidity": liq,
-            "yes_token_id": yes_id,
-            "no_token_id": no_id,
+            "yes_token_id": tokens[0],
+            "no_token_id": tokens[1],
         }
 
     return None
+
+ 
 
 
 # =========================
