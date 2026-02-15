@@ -25,13 +25,17 @@ class Config:
 
     dry_run: bool
 
+    # Risk controls
     trade_usd: float
     max_open_positions: int
     max_trades_per_day: int
+    daily_max_loss_usd: float  # NEW: daily hard stop loss
 
     tp_pct: float
     sl_pct: float
-    max_spread: float
+
+    max_spread: float          # spread ratio threshold (e.g., 0.03 = 3%)
+    min_top_size: int          # NEW: require some liquidity at top of book
 
     scan_interval_sec: int
     end_buffer_sec: int
@@ -49,13 +53,18 @@ class Config:
             return v
 
         pk = req("POLYMARKET_PK")
-        # basic pk check (0x + hex)
         if not pk.startswith("0x"):
             raise RuntimeError("POLYMARKET_PK must start with 0x")
         hexpart = pk[2:]
         if any(c not in "0123456789abcdefABCDEF" for c in hexpart):
             raise RuntimeError("POLYMARKET_PK is not valid hex")
 
+        # Daha düşük risk için güvenli defaultlar:
+        # - trade_usd 6 -> 3
+        # - max_open_positions 2 -> 1
+        # - max_trades_per_day 10 -> 6
+        # - max_spread 0.15 -> 0.05 (5%)  (istersen 0.08-0.12 arası deneyebilirsin)
+        # - günlük max loss: 6$ (istersen 3-10 arası)
         return Config(
             private_key=pk,
             chain_id=int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
@@ -65,17 +74,20 @@ class Config:
 
             dry_run=os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes", "y"),
 
-            trade_usd=float(os.getenv("TRADE_USD", "6")),
-            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "2")),
-            max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "10")),
+            trade_usd=float(os.getenv("TRADE_USD", "3")),
+            max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "1")),
+            max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "6")),
+            daily_max_loss_usd=float(os.getenv("DAILY_MAX_LOSS_USD", "6")),
 
-            tp_pct=float(os.getenv("TP_PCT", "0.06")),
-            sl_pct=float(os.getenv("SL_PCT", "0.04")),
-            max_spread=float(os.getenv("MAX_SPREAD", "0.15")),
+            tp_pct=float(os.getenv("TP_PCT", "0.03")),
+            sl_pct=float(os.getenv("SL_PCT", "0.02")),
+
+            max_spread=float(os.getenv("MAX_SPREAD", "0.05")),
+            min_top_size=int(os.getenv("MIN_TOP_SIZE", "20")),
 
             scan_interval_sec=int(os.getenv("SCAN_INTERVAL_SEC", "3")),
             end_buffer_sec=int(os.getenv("END_BUFFER_SEC", "10")),
-            cooldown_after_trade_sec=int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "20")),
+            cooldown_after_trade_sec=int(os.getenv("COOLDOWN_AFTER_TRADE_SEC", "25")),
 
             mom_window_sec=int(os.getenv("MOM_WINDOW_SEC", "60")),
             mom_threshold=float(os.getenv("MOM_THRESHOLD", "0.008")),
@@ -88,7 +100,7 @@ def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 # ----------------------------
-# STATE (in-memory)
+# STATE
 # ----------------------------
 class RollingMid:
     def __init__(self):
@@ -115,18 +127,11 @@ class RollingMid:
 # POLY HELPERS
 # ----------------------------
 def make_client(cfg: Config) -> ClobClient:
-    client = ClobClient(
-        cfg.clob_host,
-        key=cfg.private_key,
-        chain_id=cfg.chain_id,
-    )
-    # creates L2 creds needed for trading endpoints
+    client = ClobClient(cfg.clob_host, key=cfg.private_key, chain_id=cfg.chain_id)
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
 def gamma_get_live_event(cfg: Config) -> Optional[Dict[str, Any]]:
-    # Use series_id filter (this is the key for 5m recurring series)
-    # order by startTime asc so first is nearest upcoming/current
     url = f"{cfg.gamma_host}/events"
     params = {
         "series_id": cfg.series_id,
@@ -139,13 +144,13 @@ def gamma_get_live_event(cfg: Config) -> Optional[Dict[str, Any]]:
     }
     r = requests.get(url, params=params, timeout=12)
     r.raise_for_status()
-    events = r.json() if isinstance(r.json(), list) else []
+    data = r.json()
+    events = data if isinstance(data, list) else []
     if not events:
         return None
 
     now = datetime.now(timezone.utc).timestamp()
     for ev in events:
-        # choose an event that hasn't ended yet (with buffer)
         end = ev.get("endDate") or ev.get("endTime")
         start = ev.get("startTime") or ev.get("startDate")
         if not end or not start:
@@ -158,12 +163,11 @@ def gamma_get_live_event(cfg: Config) -> Optional[Dict[str, Any]]:
 
         if end_ts <= now + cfg.end_buffer_sec:
             continue
-        # must have markets list
+
         markets = ev.get("markets") or []
         if not markets:
             continue
         m0 = markets[0]
-        # only tradable
         if m0.get("acceptingOrders") is False:
             continue
         return ev
@@ -171,44 +175,77 @@ def gamma_get_live_event(cfg: Config) -> Optional[Dict[str, Any]]:
     return None
 
 def parse_token_ids(market_obj: Dict[str, Any]) -> Tuple[str, str]:
-    # clobTokenIds can be list or a JSON string
     ids = market_obj.get("clobTokenIds")
     if isinstance(ids, str):
         ids = json.loads(ids)
     if not isinstance(ids, list) or len(ids) < 2:
         raise RuntimeError("Market missing clobTokenIds")
-    yes_id = str(ids[0])
-    no_id = str(ids[1])
-    return yes_id, no_id
+    return str(ids[0]), str(ids[1])
 
-def get_best_bid_ask(client: ClobClient, token_id: str) -> Tuple[Optional[float], Optional[float]]:
-    ob = client.get_order_book(token_id)
-    bids = ob.bids or []
-    asks = ob.asks or []
-    bid = float(bids[0].price) if bids else None
-    ask = float(asks[0].price) if asks else None
-    return bid, ask
-
-def spread_pct(bid: Optional[float], ask: Optional[float]) -> float:
-    if bid is None or ask is None or bid <= 0 or ask <= 0:
-        return 9e9
-    mid = (bid + ask) / 2
-    return (ask - bid) / mid if mid > 0 else 9e9
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 def clamp_price(p: float) -> float:
-    return max(0.01, min(0.99, p))
+    # Polymarket price bounds
+    p = max(0.01, min(0.99, p))
+    # tick gibi davran: 0.001 yuvarla (daha stabil)
+    return round(p, 3)
 
 def shares_for_usd(usd: float, price: float) -> int:
-    # Polymarket shares are integer
     if price <= 0:
         return 0
     return int(math.floor(usd / price))
+
+def get_best_bid_ask_size(client: ClobClient, token_id: str) -> Tuple[Optional[float], Optional[float], int, int]:
+    """
+    Return (bid, ask, bid_size, ask_size).
+    If empty/invalid, return None.
+    """
+    ob = client.get_order_book(token_id)
+    bids = ob.bids or []
+    asks = ob.asks or []
+
+    if not bids or not asks:
+        return None, None, 0, 0
+
+    bid = safe_float(bids[0].price)
+    ask = safe_float(asks[0].price)
+    bsz = int(safe_float(getattr(bids[0], "size", 0)) or 0)
+    asz = int(safe_float(getattr(asks[0], "size", 0)) or 0)
+
+    # basic sanity
+    if bid is None or ask is None:
+        return None, None, 0, 0
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None, None, 0, 0
+
+    # Polymarket bounds sanity
+    if bid > 1 or ask > 1:
+        return None, None, 0, 0
+
+    return bid, ask, bsz, asz
+
+def spread_ratio(bid: float, ask: float) -> Optional[float]:
+    """
+    Spread ratio vs mid. Example: 0.03 = 3%
+    """
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
 
 def post_gtc(client: ClobClient, args: OrderArgs) -> Dict[str, Any]:
     signed = client.create_order(args)
     return client.post_order(signed, OrderType.GTC)
 
-def try_fill_or_cancel(client: ClobClient, order_id: str, wait_sec: int = 8) -> str:
+def try_fill_or_cancel(client: ClobClient, order_id: str, wait_sec: int = 6) -> str:
     deadline = time.time() + wait_sec
     last_status = "unknown"
     while time.time() < deadline:
@@ -217,7 +254,6 @@ def try_fill_or_cancel(client: ClobClient, order_id: str, wait_sec: int = 8) -> 
         if last_status in ("filled", "canceled", "cancelled", "expired", "rejected"):
             return last_status
         time.sleep(1.0)
-    # cancel if still open
     try:
         client.cancel(order_id)
     except Exception:
@@ -232,7 +268,8 @@ def main():
     client = make_client(cfg)
 
     log(f"ONLINE DRY_RUN={cfg.dry_run} trade=${cfg.trade_usd:.2f} maxOpen={cfg.max_open_positions} maxTrades={cfg.max_trades_per_day}")
-    log(f"Filters: maxSpread={cfg.max_spread} endBuffer={cfg.end_buffer_sec}s momWindow={cfg.mom_window_sec}s thr={cfg.mom_threshold}")
+    log(f"Filters: maxSpread={cfg.max_spread} minTopSize={cfg.min_top_size} endBuffer={cfg.end_buffer_sec}s momWindow={cfg.mom_window_sec}s thr={cfg.mom_threshold}")
+    log(f"Risk: TP={cfg.tp_pct} SL={cfg.sl_pct} dailyMaxLoss=${cfg.daily_max_loss_usd:.2f}")
 
     open_positions: List[Dict[str, Any]] = []
     trades_today = 0
@@ -240,17 +277,27 @@ def main():
 
     mids: Dict[str, RollingMid] = {}
 
+    # simple PnL tracking (approx)
+    realized_pnl_usd = 0.0
+
     while True:
-        # reset daily counter
         today = datetime.now().strftime("%Y-%m-%d")
         if today != day_key:
             day_key = today
             trades_today = 0
             open_positions = []
+            mids = {}
+            realized_pnl_usd = 0.0
             log("New day: counters reset")
 
         if trades_today >= cfg.max_trades_per_day:
             time.sleep(10)
+            continue
+
+        # daily loss hard stop
+        if realized_pnl_usd <= -abs(cfg.daily_max_loss_usd):
+            log(f"DAILY STOP: realizedPnL=${realized_pnl_usd:.2f} <= -${abs(cfg.daily_max_loss_usd):.2f}. Sleeping...")
+            time.sleep(60)
             continue
 
         try:
@@ -264,66 +311,86 @@ def main():
             m0 = markets[0]
             yes_id, no_id = parse_token_ids(m0)
 
-            # ensure orderbooks exist + spread ok
-            yb, ya = get_best_bid_ask(client, yes_id)
-            nb, na = get_best_bid_ask(client, no_id)
+            # Fetch books with size
+            yb, ya, ybsz, yasz = get_best_bid_ask_size(client, yes_id)
+            nb, na, nbsz, nasz = get_best_bid_ask_size(client, no_id)
 
-            ysp = spread_pct(yb, ya)
-            nsp = spread_pct(nb, na)
-            if min(ysp, nsp) > cfg.max_spread:
-                log(f"Skip: spreads too wide YES={ysp:.3f} NO={nsp:.3f}")
+            # If any side invalid -> skip (no more 9e9 nonsense)
+            if yb is None or ya is None or nb is None or na is None:
+                log("Skip: orderbook missing/invalid (bid/ask None)")
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            # Liquidity filter (top size)
+            if min(ybsz, yasz) < cfg.min_top_size or min(nbsz, nasz) < cfg.min_top_size:
+                log(f"Skip: low top liquidity YES(bidSz={ybsz},askSz={yasz}) NO(bidSz={nbsz},askSz={nasz})")
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            ysp = spread_ratio(yb, ya)
+            nsp = spread_ratio(nb, na)
+            if ysp is None or nsp is None:
+                log("Skip: spread calc invalid")
+                time.sleep(cfg.scan_interval_sec)
+                continue
+
+            # IMPORTANT FIX:
+            # Önceki kod min(ysp,nsp) ile bakıyordu -> biri iyi görünürse geçebiliyordu.
+            # Daha güvenlisi: her ikisi de limitin altında olmalı.
+            if ysp > cfg.max_spread or nsp > cfg.max_spread:
+                log(f"Skip: spreads too wide YES={ysp:.3f} (bid={yb:.3f} ask={ya:.3f}) NO={nsp:.3f} (bid={nb:.3f} ask={na:.3f})")
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
             now_ts = time.time()
-            # track mids
-            if yb is not None and ya is not None:
-                ym = (yb + ya) / 2
-                mids.setdefault(yes_id, RollingMid()).add(now_ts, ym)
-                mids[yes_id].prune(now_ts, cfg.mom_window_sec)
 
-            if nb is not None and na is not None:
-                nm = (nb + na) / 2
-                mids.setdefault(no_id, RollingMid()).add(now_ts, nm)
-                mids[no_id].prune(now_ts, cfg.mom_window_sec)
+            # track mids
+            ym = (yb + ya) / 2
+            nm = (nb + na) / 2
+            mids.setdefault(yes_id, RollingMid()).add(now_ts, ym)
+            mids[yes_id].prune(now_ts, cfg.mom_window_sec)
+            mids.setdefault(no_id, RollingMid()).add(now_ts, nm)
+            mids[no_id].prune(now_ts, cfg.mom_window_sec)
+
+            # event timestamps
+            end_iso = ev.get("endDate") or ev.get("endTime")
+            start_iso = ev.get("startTime") or ev.get("startDate")
+            end_ts = datetime.fromisoformat(end_iso.replace("Z", "+00:00")).timestamp()
+            start_ts = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).timestamp()
 
             # manage exits
             still_open: List[Dict[str, Any]] = []
             for pos in open_positions:
                 token_id = pos["token_id"]
-                side = pos["side"]  # BUY on entry
                 entry = pos["entry_price"]
                 qty = pos["qty"]
-                opened_at = pos["opened_at"]
-                end_ts = pos["end_ts"]
+                pos_outcome = pos["outcome"]
 
-                bid, ask = get_best_bid_ask(client, token_id)
+                bid, ask, bsz, asz = get_best_bid_ask_size(client, token_id)
                 if bid is None or ask is None:
                     still_open.append(pos)
                     continue
-                mid = (bid + ask) / 2
 
-                # TP/SL on mid vs entry
+                mid = (bid + ask) / 2
                 tp_hit = (mid - entry) / entry >= cfg.tp_pct
                 sl_hit = (entry - mid) / entry >= cfg.sl_pct
                 time_left = end_ts - time.time()
 
                 if tp_hit or sl_hit or time_left <= cfg.end_buffer_sec:
                     reason = "TP" if tp_hit else ("SL" if sl_hit else "TIME")
-                    exit_price = clamp_price(bid)  # sell at bid to exit fast
-                    log(f"EXIT {reason}: token={token_id[:10]}.. qty={qty} entry={entry:.3f} mid={mid:.3f} sell@{exit_price:.3f}")
+                    exit_price = clamp_price(bid)  # exit at bid
+                    log(f"EXIT {reason} {pos_outcome}: qty={qty} entry={entry:.3f} mid={mid:.3f} sell@{exit_price:.3f}")
+
+                    # Approx realized PnL in USD (shares * price delta)
+                    approx_pnl = qty * (exit_price - entry)
+                    realized_pnl_usd += approx_pnl
 
                     if not cfg.dry_run:
-                        args = OrderArgs(
-                            price=exit_price,
-                            size=qty,
-                            side=SELL,
-                            token_id=token_id,
-                        )
+                        args = OrderArgs(price=exit_price, size=qty, side=SELL, token_id=token_id)
                         resp = post_gtc(client, args)
                         oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
                         if oid:
-                            st = try_fill_or_cancel(client, oid, wait_sec=8)
+                            st = try_fill_or_cancel(client, oid, wait_sec=6)
                             log(f"EXIT order status: {st}")
                     else:
                         log("DRY_RUN: exit order skipped")
@@ -334,89 +401,21 @@ def main():
 
             open_positions = still_open
 
-            # entry logic (only if we have room)
+            # entry logic
             if len(open_positions) >= cfg.max_open_positions:
                 time.sleep(cfg.scan_interval_sec)
                 continue
 
-            # momentum signal using mid history
-            y_mom = mids.get(yes_id).mom() if yes_id in mids else None
-            n_mom = mids.get(no_id).mom() if no_id in mids else None
+            # don't open too close to end
+            if end_ts - time.time() <= cfg.end_buffer_sec + 8:
+                time.sleep(cfg.scan_interval_sec)
+                continue
 
-            # choose side
+            # momentum signal
+            y_mom = mids.get(yes_id).mom()
+            n_mom = mids.get(no_id).mom()
+
             pick = None
             if y_mom is not None and y_mom >= cfg.mom_threshold:
-                pick = ("YES", yes_id, ya)  # buy at ask
-            elif n_mom is not None and n_mom >= cfg.mom_threshold:
-                pick = ("NO", no_id, na)
-
-            if not pick:
-                # no signal
-                time.sleep(cfg.scan_interval_sec)
-                continue
-
-            outcome, token_id, ask_price = pick
-            if ask_price is None:
-                time.sleep(cfg.scan_interval_sec)
-                continue
-
-            price = clamp_price(float(ask_price))
-            qty = shares_for_usd(cfg.trade_usd, price)
-            if qty < 1:
-                time.sleep(cfg.scan_interval_sec)
-                continue
-
-            # event times for time-based exit
-            end_iso = ev.get("endDate") or ev.get("endTime")
-            start_iso = ev.get("startTime") or ev.get("startDate")
-            end_ts = datetime.fromisoformat(end_iso.replace("Z", "+00:00")).timestamp()
-            start_ts = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).timestamp()
-
-            # don't open too close to end
-            if end_ts - time.time() <= cfg.end_buffer_sec + 5:
-                time.sleep(cfg.scan_interval_sec)
-                continue
-
-            log(f"ENTRY {outcome}: qty={qty} buy@{price:.3f} momYES={y_mom} momNO={n_mom}")
-
-            if not cfg.dry_run:
-                args = OrderArgs(
-                    price=price,
-                    size=qty,
-                    side=BUY,
-                    token_id=token_id,
-                )
-                resp = post_gtc(client, args)
-                oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
-                if oid:
-                    st = try_fill_or_cancel(client, oid, wait_sec=8)
-                    log(f"ENTRY order status: {st}")
-                    if st != "filled":
-                        # if not filled, don't count as trade / position
-                        time.sleep(cfg.scan_interval_sec)
-                        continue
-            else:
-                log("DRY_RUN: entry order skipped")
-
-            # record open position
-            open_positions.append({
-                "side": BUY,
-                "outcome": outcome,
-                "token_id": token_id,
-                "qty": qty,
-                "entry_price": price,
-                "opened_at": time.time(),
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "event_slug": ev.get("slug"),
-            })
-            trades_today += 1
-
-            time.sleep(cfg.scan_interval_sec)
-
-        except Exception as e:
-            log(f"ERROR: {type(e).__name__}: {e}")
-            time.sleep(max(3, cfg.scan_interval_sec))
-
-if __name__ == "__main__":
-    main()
+                pick = ("YES", yes_id)
+            elif n
